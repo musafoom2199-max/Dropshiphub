@@ -4,7 +4,6 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 
 dotenv.config();
-
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: '*' }));
@@ -15,84 +14,56 @@ const CJ_API_KEY = process.env.CJ_API_KEY;
 const MARGIN = parseFloat(process.env.PROFIT_MARGIN || '0.15');
 const PORT = process.env.PORT || 10000;
 
-console.log('ENV CHECK:', { SHOPIFY_DOMAIN, HAS_TOKEN: !!SHOPIFY_TOKEN, HAS_CJ: !!CJ_API_KEY });
-
 const shopify = axios.create({
   baseURL: `https://${SHOPIFY_DOMAIN}/admin/api/2024-07`,
   headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN, 'Content-Type': 'application/json' }
 });
 
-app.get('/', (req, res) => {
-  res.send('DropshipHub running — MA fashion house connected ✅');
-});
+app.get('/', (req, res) => res.send('DropshipHub V3 — MA fashion house ✅'));
+app.get('/api/health', (req, res) => res.json({ status:'ok', version:'V3', shopify_domain: SHOPIFY_DOMAIN, has_token:!!SHOPIFY_TOKEN, has_cj:!!CJ_API_KEY, margin:MARGIN, time:new Date().toISOString() }));
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', shopify: SHOPIFY_DOMAIN, has_token: !!SHOPIFY_TOKEN, margin: MARGIN, time: new Date().toISOString() });
-});
-
-app.get('/api/cj/search', async (req, res) => {
+// NEW — This makes My Store tab work!
+app.get('/api/shopify/products', async (req, res) => {
   try {
-    const { keyword = 'fashion', page = 1 } = req.query;
-    if (!CJ_API_KEY) return res.json({ result: false, message: 'CJ_API_KEY missing - using mock' });
-    const r = await axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', {
-      headers: { 'CJ-Access-Token': CJ_API_KEY },
-      params: { keyword, pageNum: page, pageSize: 20 }
-    });
-    res.json(r.data);
-  } catch (e) {
-    res.status(200).json({ result: false, error: e.response?.data || e.message, fallback: true });
+    const r = await shopify.get('/products.json?limit=50&order=created_at desc');
+    const products = r.data.products.map(p => ({ 
+      id:p.id, title:p.title, handle:p.handle, status:p.status, 
+      price:p.variants?.[0]?.price, image:p.images?.[0]?.src, 
+      admin_url:`https://${SHOPIFY_DOMAIN}/admin/products/${p.id}`, 
+      store_url:`https://${SHOPIFY_DOMAIN}/products/${p.handle}` 
+    }));
+    res.json({ success:true, count:products.length, products });
+  } catch(e) {
+    res.status(500).json({ error:'Shopify fetch failed', details:e.response?.data||e.message });
   }
 });
+
+const MOCK_ABAYAS = [
+  { pid:'mock-noor-001', productNameEn:'Noor Embroidered Abaya - Midnight Black', sellPrice:'68.00', productImage:'https://images.unsplash.com/photo-1595777457583-95e059d581b8?w=500', images:['https://images.unsplash.com/photo-1595777457583-95e059d581b8?w=600'], categoryName:'Abaya', description:'Luxury embroidered abaya' },
+  { pid:'mock-sahara-002', productNameEn:'Sahara Linen Maxi Dress - Desert Sand', sellPrice:'55.00', productImage:'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?w=500', images:['https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?w=600'], categoryName:'Maxi Dress', description:'Breathable linen maxi dress' }
+];
 
 app.get('/api/search', async (req, res) => {
-  try {
-    const { q = 'fashion', keyword, page = 1 } = req.query;
-    const searchKey = q || keyword || 'fashion';
-    if (!CJ_API_KEY) return res.json({ result: false, message: 'CJ_API_KEY missing - using mock', fallback: true });
-    const r = await axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', {
-      headers: { 'CJ-Access-Token': CJ_API_KEY },
-      params: { keyword: searchKey, pageNum: page, pageSize: 20 }
-    });
-    res.json(r.data);
-  } catch (e) {
-    res.status(200).json({ result: false, error: e.response?.data || e.message, fallback: true });
-  }
+  const { q='abaya' } = req.query;
+  if (!process.env.CJ_API_KEY) return res.json({ success:true, mock:true, data:{ list:MOCK_ABAYAS } });
+  try { const r = await axios.get('https://developers.cjdropshipping.com/api2.0/v1/product/list', { headers:{ 'CJ-Access-Token':process.env.CJ_API_KEY }, params:{ keyword:q, pageNum:1, pageSize:20 } }); res.json(r.data); }
+  catch(e){ res.json({ mock:true, data:{ list:MOCK_ABAYAS } }); }
 });
 
 app.post('/api/import', async (req, res) => {
   try {
-    if (!SHOPIFY_DOMAIN || !SHOPIFY_TOKEN) {
-      return res.status(400).json({ success: false, error: `MISSING ENV: DOMAIN=${!!SHOPIFY_DOMAIN} TOKEN=${!!SHOPIFY_TOKEN}` });
-    }
     const { cjProduct } = req.body;
-    const productData = cjProduct || { productNameEn: 'Noor Embroidered Abaya', sellPrice: 89.99, description: 'MA Fashion House - Premium Abaya', categoryName: 'Abaya', pid: 'NOOR-001', productImageSet: ['https://images.unsplash.com/photo-1595777457583-95e059d581b8'] };
-    
-    const cjPrice = parseFloat(productData.sellPrice || productData.productSellPrice || productData.price || 89.99);
-    const myPrice = (cjPrice * (1 + MARGIN)).toFixed(2);
-
-    const shopifyProduct = {
-      product: {
-        title: productData.productNameEn || productData.productName || 'MA Fashion Product',
-        body_html: productData.description || 'MA Fashion House - Premium Import',
-        vendor: 'MA Fashion House',
-        product_type: productData.categoryName || 'Fashion',
-        tags: 'MA Fashion, abaya, curated',
-        images: (productData.productImageSet || productData.images || ['https://images.unsplash.com/photo-1595777457583-95e059d581b8']).slice(0,5).map(src => ({ src: typeof src === 'string' ? src : src.productImage || src })),
-        variants: [{ price: myPrice, sku: productData.pid || Date.now().toString(), inventory_management: null }]
-      }
-    };
-
-    console.log('Importing to Shopify:', SHOPIFY_DOMAIN, shopifyProduct.product.title);
+    const cjPrice = parseFloat(cjProduct.sellPrice||68);
+    const myPrice = (cjPrice*(1+MARGIN)).toFixed(2);
+    const shopifyProduct = { product:{ title:cjProduct.productNameEn, body_html:cjProduct.description, vendor:'MA Fashion House', product_type:cjProduct.categoryName||'Abaya', tags:'abaya, MA fashion', images:(cjProduct.images||[cjProduct.productImage]).slice(0,5).map(src=>({src:typeof src==='string'?src:src})), variants:[{ price:myPrice, sku:cjProduct.pid, inventory_management:null }] } };
     const r = await shopify.post('/products.json', shopifyProduct);
-    res.json({ success: true, shopifyProduct: r.data.product, myPrice, cjPrice });
-  } catch (e) {
-    console.error('IMPORT ERROR:', e.response?.data || e.message);
-    const errorData = e.response?.data || e.message;
-    const errorString = typeof errorData === 'string' ? errorData.substring(0,500) : JSON.stringify(errorData).substring(0,500);
-    res.status(500).json({ success: false, error: errorString, full: e.response?.data });
+    res.json({ success:true, shopifyProduct:r.data.product, myPrice, cjPrice });
+  } catch(e) {
+    let d=e.response?.data||e.message;
+    if(typeof d==='string'&&d.includes('<!DOCTYPE')) return res.status(500).json({ error:'Token mismatch! Regenerate token!', details:d.substring(0,200) });
+    res.status(500).json({ error:'Import failed', details:d });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Dropshiphub listening on ${PORT}`);
-});
+app.use((err,req,res,next)=>res.status(500).json({ error:err.message }));
+app.listen(PORT, ()=>console.log(`V3 listening on ${PORT}`));
